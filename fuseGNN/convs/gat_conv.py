@@ -2,7 +2,6 @@ import torch
 from torch_geometric.nn import GATConv as geoGATConv
 from fuseGNN.functional import fused_gar_agg, fused_gas_agg, csr2csc, coo2csr, gat_gar_edge_weight, gat_gas_edge_weight
 from fuseGNN.functional.format import Coo2Csr
-import gcnlib_gat
 from torch.nn import Parameter
 import torch.nn.functional as F
 import torch_scatter
