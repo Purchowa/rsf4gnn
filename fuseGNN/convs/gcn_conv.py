@@ -1,6 +1,5 @@
 import torch
 import torch_scatter
-import gcnlib_cuda
 from torch_geometric.nn import GCNConv as geoGCNConv
 from fuseGNN.functional import coo2csr, gcn_gar_edge_weight, csr2csc, fused_gar_agg , gcn_gas_edge_weight, fused_gas_agg
 import torch.nn.functional as F
