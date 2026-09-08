@@ -178,13 +178,26 @@ class garGCNConv(torch.nn.Module):
         # self.stream1 = torch.cuda.Stream()
         # self.stream2 = torch.cuda.Stream()
     
-    def forward(self, x, edge_index=None, edge_weight=None, self_edge_weight=None, tar_ptr=None, 
-                src_index=None, src_ptr=None, tar_index=None, edge_weight_b=None):
+    def forward(self, x, edge_index=None, edge_weight=None, self_edge_weight=None, tar_ptr=None,
+                src_index=None, src_ptr=None, tar_index=None, edge_weight_b=None,
+                sampling_debug_enabled=False, sampling_debug_fail_fast=False,
+                sampling_debug_split='unknown', sampling_debug_batch=-1, sampling_debug_layer=-1):
         
         x = self.dense(x)
         if not self.cached or self.cached_num_edges is None:  
             # when the results are not cached, or it is the first execution.
             if tar_ptr is not None: # when the CSR & CSC format are provided
+                if sampling_debug_enabled:
+                    print(
+                        '[SamplingDebug][GARConv] split={} batch={} layer={} using prebuilt CSR '
+                        'tar_ptr_rows={} src_edges={}'.format(
+                            sampling_debug_split,
+                            sampling_debug_batch,
+                            sampling_debug_layer,
+                            int(tar_ptr.size(0)),
+                            int(src_index.size(0)) if src_index is not None else -1,
+                        )
+                    )
                 self.cached_tar_ptr = tar_ptr
                 self.cached_src_index = src_index
                 self.cached_edge_weight_f = edge_weight
@@ -199,14 +212,71 @@ class garGCNConv(torch.nn.Module):
                 # convert the edge lists to int32
                 edge_index = edge_index.to(torch.int32)
                 src_index, tar_index = (edge_index[self.sid], edge_index[self.tid])
+
+                # In sampled mode with reordering, some mini-batch layers can be
+                # edge-empty. The mathematically correct GAR output for this case
+                # is self-loop-only aggregation, i.e. identity on transformed x.
+                if src_index.numel() == 0:
+                    if sampling_debug_enabled:
+                        print(
+                            '[SamplingDebug][GARConv] split={} batch={} layer={} empty sampled edges; '
+                            'using self-loop-only fallback'.format(
+                                sampling_debug_split,
+                                sampling_debug_batch,
+                                sampling_debug_layer,
+                            )
+                        )
+                    return x
+
                 # convert coo format to csr format
                 self.cached_src_index, tar_index, self.cached_tar_ptr, edge_weight_f = coo2csr(src_index, tar_index, 
                                                                        num_nodes, edge_weight, False)
+                if sampling_debug_enabled:
+                    print(
+                        '[SamplingDebug][GARConv] split={} batch={} layer={} x_rows={} '
+                        'src_edges={} tar_ptr_rows={} src_dtype={} tar_dtype={}'.format(
+                            sampling_debug_split,
+                            sampling_debug_batch,
+                            sampling_debug_layer,
+                            int(num_nodes),
+                            int(self.cached_src_index.size(0)),
+                            int(self.cached_tar_ptr.size(0)),
+                            str(self.cached_src_index.dtype),
+                            str(tar_index.dtype),
+                        )
+                    )
+
+                if sampling_debug_fail_fast:
+                    if not self.cached_src_index.is_cuda or not self.cached_tar_ptr.is_cuda or not tar_index.is_cuda:
+                        raise RuntimeError(
+                            'GAR sampled fused inputs must be CUDA tensors: split={} batch={} layer={}'.format(
+                                sampling_debug_split, sampling_debug_batch, sampling_debug_layer
+                            )
+                        )
+                    max_src = int(self.cached_src_index.max().item()) if self.cached_src_index.numel() > 0 else -1
+                    max_tar = int(tar_index.max().item()) if tar_index.numel() > 0 else -1
+                    if max_src >= int(num_nodes) or max_tar >= int(num_nodes):
+                        raise RuntimeError(
+                            'GAR sampled local-domain mismatch: split={} batch={} layer={} max_src={} max_tar={} x_rows={}'.format(
+                                sampling_debug_split,
+                                sampling_debug_batch,
+                                sampling_debug_layer,
+                                max_src,
+                                max_tar,
+                                int(num_nodes),
+                            )
+                        )
+
                 # update edge weight
                 self.cached_edge_weight_f, self.cached_self_edge_weight = gcn_gar_edge_weight(self.cached_src_index, 
                                                                                               self.cached_tar_ptr, tar_index,
                                                                                               num_nodes, edge_weight_f,
-                                                                                              self.flow)
+                                                                                              self.flow,
+                                                                                              sampling_debug_enabled=sampling_debug_enabled,
+                                                                                              sampling_debug_fail_fast=sampling_debug_fail_fast,
+                                                                                              sampling_debug_split=sampling_debug_split,
+                                                                                              sampling_debug_batch=sampling_debug_batch,
+                                                                                              sampling_debug_layer=sampling_debug_layer)
                 # get the csc format for backward pass
                 self.cached_src_ptr, self.cached_tar_index, self.cached_edge_weight_b = csr2csc(self.cached_tar_ptr,
                                                                                                 self.cached_src_index,
@@ -260,7 +330,9 @@ class gasGCNConv(torch.nn.Module):
         # self.stream1 = torch.cuda.Stream()
         # self.stream2 = torch.cuda.Stream()
     
-    def forward(self, x, edge_index=None, edge_weight=None, src_index=None, tar_index=None, self_edge_weight=None):
+    def forward(self, x, edge_index=None, edge_weight=None, src_index=None, tar_index=None, self_edge_weight=None,
+                sampling_debug_enabled=False, sampling_debug_fail_fast=False,
+                sampling_debug_split='unknown', sampling_debug_batch=-1, sampling_debug_layer=-1):
         x = self.dense(x)
         if not self.cached or self.cached_num_edges is None:
             if self_edge_weight is not None:
@@ -273,11 +345,66 @@ class gasGCNConv(torch.nn.Module):
                 num_nodes = x.size(0)
                 edge_index = edge_index.to(torch.int32)
                 self.cached_src_index, self.cached_tar_index = (edge_index[self.sid], edge_index[self.tid])
+
+                # In sampled mode with reordering, some mini-batch layers can be
+                # edge-empty. For GAS this reduces to self-loop-only aggregation.
+                if self.cached_src_index.numel() == 0:
+                    if sampling_debug_enabled:
+                        print(
+                            '[SamplingDebug][GASConv] split={} batch={} layer={} empty sampled edges; '
+                            'using self-loop-only fallback'.format(
+                                sampling_debug_split,
+                                sampling_debug_batch,
+                                sampling_debug_layer,
+                            )
+                        )
+                    return x
+
+                if sampling_debug_enabled:
+                    print(
+                        '[SamplingDebug][GASConv] split={} batch={} layer={} x_rows={} '
+                        'edges={} src_dtype={} tar_dtype={}'.format(
+                            sampling_debug_split,
+                            sampling_debug_batch,
+                            sampling_debug_layer,
+                            int(num_nodes),
+                            int(self.cached_src_index.size(0)),
+                            str(self.cached_src_index.dtype),
+                            str(self.cached_tar_index.dtype),
+                        )
+                    )
+
+                if sampling_debug_fail_fast:
+                    if not self.cached_src_index.is_cuda or not self.cached_tar_index.is_cuda:
+                        raise RuntimeError(
+                            'GAS sampled fused inputs must be CUDA tensors: split={} batch={} layer={}'.format(
+                                sampling_debug_split, sampling_debug_batch, sampling_debug_layer
+                            )
+                        )
+                    max_src = int(self.cached_src_index.max().item()) if self.cached_src_index.numel() > 0 else -1
+                    max_tar = int(self.cached_tar_index.max().item()) if self.cached_tar_index.numel() > 0 else -1
+                    if max_src >= int(num_nodes) or max_tar >= int(num_nodes):
+                        raise RuntimeError(
+                            'GAS sampled local-domain mismatch: split={} batch={} layer={} max_src={} max_tar={} x_rows={}'.format(
+                                sampling_debug_split,
+                                sampling_debug_batch,
+                                sampling_debug_layer,
+                                max_src,
+                                max_tar,
+                                int(num_nodes),
+                            )
+                        )
+
                 self.cached_edge_weight, self.cached_self_edge_weight = gcn_gas_edge_weight(self.cached_src_index,
                                                                                             self.cached_tar_index,
                                                                                             num_nodes,
                                                                                             edge_weight,
-                                                                                            self.flow)
+                                                                                            self.flow,
+                                                                                            sampling_debug_enabled=sampling_debug_enabled,
+                                                                                            sampling_debug_fail_fast=sampling_debug_fail_fast,
+                                                                                            sampling_debug_split=sampling_debug_split,
+                                                                                            sampling_debug_batch=sampling_debug_batch,
+                                                                                            sampling_debug_layer=sampling_debug_layer)
                 self.cached_num_edges = self.cached_src_index.size(0)
         return fused_gas_agg(feature=x, src_index=self.cached_src_index, tar_index=self.cached_tar_index,
                              edge_weight=self.cached_edge_weight, self_edge_weight=self.cached_self_edge_weight,

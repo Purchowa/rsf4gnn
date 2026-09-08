@@ -33,27 +33,21 @@ std::vector<torch::Tensor> csr2csc_cuda(
     void *d_temp_storage = NULL;
     size_t temp_storage_bytes = 0;
 
-    AT_DISPATCH_FLOATING_TYPES(inVal.type(), "get temporary device storage requirement", ([&]{
-        cusparseCsr2cscEx2_bufferSize(handle, num_row, num_row, nnz, inVal.data<scalar_t>(), inPtr.data<int>(),
-                                  inInd.data<int>(), outVal.data<scalar_t>(), outPtr.data<int>(), outInd.data<int>(),
-                                  CUDA_R_32F, CUSPARSE_ACTION_NUMERIC, CUSPARSE_INDEX_BASE_ZERO, CUSPARSE_CSR2CSC_ALG2,
-                                  &temp_storage_bytes
-                                );
-                            }));
-
-    
+    AT_DISPATCH_FLOATING_TYPES(inVal.type(), "get temporary device storage requirement", ([&]
+                                                                                          { cusparseCsr2cscEx2_bufferSize(handle, num_row, num_row, nnz, inVal.data<scalar_t>(), inPtr.data<int>(),
+                                                                                                                          inInd.data<int>(), outVal.data<scalar_t>(), outPtr.data<int>(), outInd.data<int>(),
+                                                                                                                          CUDA_R_32F, CUSPARSE_ACTION_NUMERIC, CUSPARSE_INDEX_BASE_ZERO, CUSPARSE_CSR2CSC_ALG_DEFAULT,
+                                                                                                                          &temp_storage_bytes); }));
 
     // Allocate temporary storage
     cudaMalloc(&d_temp_storage, temp_storage_bytes);
 
     // Do the conversion
-    AT_DISPATCH_FLOATING_TYPES(inVal.type(), "type convert", ([&]{
-    cusparseCsr2cscEx2(handle, num_row, num_row, nnz, inVal.data<scalar_t>(), inPtr.data<int>(),
-                       inInd.data<int>(), outVal.data<scalar_t>(), outPtr.data<int>(), outInd.data<int>(),
-                       CUDA_R_32F, CUSPARSE_ACTION_NUMERIC, CUSPARSE_INDEX_BASE_ZERO, CUSPARSE_CSR2CSC_ALG2,
-                       d_temp_storage
-                    );
-                }));
+    AT_DISPATCH_FLOATING_TYPES(inVal.type(), "type convert", ([&]
+                                                              { cusparseCsr2cscEx2(handle, num_row, num_row, nnz, inVal.data<scalar_t>(), inPtr.data<int>(),
+                                                                                   inInd.data<int>(), outVal.data<scalar_t>(), outPtr.data<int>(), outInd.data<int>(),
+                                                                                   CUDA_R_32F, CUSPARSE_ACTION_NUMERIC, CUSPARSE_INDEX_BASE_ZERO, CUSPARSE_CSR2CSC_ALG_DEFAULT,
+                                                                                   d_temp_storage); }));
 
     cusparseDestroy(handle); 
     cudaFree(d_temp_storage);

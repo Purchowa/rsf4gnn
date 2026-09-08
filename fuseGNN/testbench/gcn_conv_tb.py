@@ -8,8 +8,8 @@ import torch_scatter
 import sys
 import torch_geometric.transforms as T
 from torch_geometric.utils import add_remaining_self_loops
-from fuseGNN.dataloader import Citations
-from fuseGNN.convs import geoGCNConv, refGCNConv, garGCNConv, gasGCNConv
+import fgnn_agg
+
 from torch_geometric.utils import degree
 from tqdm import tqdm
 import numpy as np

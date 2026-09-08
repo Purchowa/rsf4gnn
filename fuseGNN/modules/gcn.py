@@ -37,9 +37,26 @@ class GCN(torch.nn.Module):
         self.reg_params = self.conv1.parameters()
         self.non_reg_params = self.conv2.parameters()
         self.drop_rate = drop_rate
+
+    @staticmethod
+    def _unpack_adj(adj):
+        """Extract edge_index and bipartite size from sampled adjacency.
+
+        Args:
+            adj: PyG adjacency object (with ``edge_index`` and ``size``) or
+                tuple representation ``(edge_index, e_id, size)``.
+
+        Returns:
+            tuple: ``(edge_index, size)`` used by sampled forward path.
+        """
+        if hasattr(adj, 'edge_index') and hasattr(adj, 'size'):
+            return adj.edge_index, adj.size
+        return adj[0], adj[2]
     
     def forward(self, data):
         x, edge_index, edge_weight = data.x, data.edge_index, data.edge_attr
+        if x.dtype != torch.float32:
+            x = x.float()
         x = F.relu(self.conv1(x, edge_index, edge_weight))
         x = F.dropout(input=x, p=self.drop_rate, training=self.training)
         if self.mode == 'gar':
@@ -52,6 +69,148 @@ class GCN(torch.nn.Module):
                            tar_index=self.conv1.cached_tar_index, self_edge_weight=self.conv1.cached_self_edge_weight)
         else:
             x = self.conv2(x, edge_index, edge_weight)
+        return F.log_softmax(x, dim=1)
+
+    def forward_sampled(
+        self,
+        x,
+        adjs,
+        gar_sampling_variant='per_batch_csr',
+        sampling_debug_enabled=False,
+        sampling_debug_fail_fast=False,
+        sampling_debug_split='unknown',
+        sampling_debug_batch=-1,
+    ):
+        """Run two-layer GCN forward on a sampled mini-batch subgraph.
+
+        This path is used by NeighborSampler-based training and evaluation.
+        It avoids full-graph assumptions and uses per-batch structures.
+
+        Args:
+            x (torch.Tensor): Batch feature matrix indexed by sampled node ids.
+            adjs (list): Two adjacency objects (one per GCN layer) from
+                NeighborSampler.
+            gar_sampling_variant (str): GAR mode selection. Accepted values are
+                ``per_batch_csr`` and ``hybrid_full_cache``.
+            sampling_debug_enabled (bool): Enables sampled debug traces.
+            sampling_debug_fail_fast (bool): Enables fail-fast sampled invariants.
+            sampling_debug_split (str): Split label for debug logs.
+            sampling_debug_batch (int): Batch index for debug logs.
+
+        Returns:
+            torch.Tensor: Log-probabilities for sampled nodes.
+        """
+        if x.dtype != torch.float32:
+            x = x.float()
+        # NeighborSampler yields one adjacency per layer.
+        adj_l1, adj_l2 = adjs[0], adjs[1]
+        edge_index_l1, _ = self._unpack_adj(adj_l1)
+        edge_index_l2, _ = self._unpack_adj(adj_l2)
+
+        # Keep sampled edge indices on the same device as features so GAR/GAS
+        # format conversion runs on GPU instead of CPU.
+        edge_index_l1 = edge_index_l1.to(x.device)
+        edge_index_l2 = edge_index_l2.to(x.device)
+
+        if sampling_debug_enabled:
+            e1_count = int(edge_index_l1.size(1))
+            e2_count = int(edge_index_l2.size(1))
+            e1_max = int(edge_index_l1.max().item()) if e1_count > 0 else -1
+            e2_max = int(edge_index_l2.max().item()) if e2_count > 0 else -1
+            print(
+                '[SamplingDebug][GCN] split={} batch={} x_rows={} '
+                'l1(dtype={},device={},contig={},edges={},max={}) '
+                'l2(dtype={},device={},contig={},edges={},max={})'.format(
+                    sampling_debug_split,
+                    sampling_debug_batch,
+                    int(x.size(0)),
+                    str(edge_index_l1.dtype),
+                    str(edge_index_l1.device),
+                    edge_index_l1.is_contiguous(),
+                    e1_count,
+                    e1_max,
+                    str(edge_index_l2.dtype),
+                    str(edge_index_l2.device),
+                    edge_index_l2.is_contiguous(),
+                    e2_count,
+                    e2_max,
+                )
+            )
+
+        if sampling_debug_fail_fast:
+            if edge_index_l1.numel() > 0 and int(edge_index_l1.max().item()) >= int(x.size(0)):
+                raise RuntimeError(
+                    'Layer1 sampled edge index out of bounds: split={} batch={} max_index={} x_rows={}'.format(
+                        sampling_debug_split,
+                        sampling_debug_batch,
+                        int(edge_index_l1.max().item()),
+                        int(x.size(0)),
+                    )
+                )
+            if edge_index_l2.numel() > 0 and int(edge_index_l2.max().item()) >= int(x.size(0)):
+                raise RuntimeError(
+                    'Layer2 sampled edge index out of bounds: split={} batch={} max_index={} x_rows={}'.format(
+                        sampling_debug_split,
+                        sampling_debug_batch,
+                        int(edge_index_l2.max().item()),
+                        int(x.size(0)),
+                    )
+                )
+
+        if self.mode in ['gar', 'gas']:
+            x = F.relu(
+                self.conv1(
+                    x,
+                    edge_index_l1,
+                    None,
+                    sampling_debug_enabled=sampling_debug_enabled,
+                    sampling_debug_fail_fast=sampling_debug_fail_fast,
+                    sampling_debug_split=sampling_debug_split,
+                    sampling_debug_batch=sampling_debug_batch,
+                    sampling_debug_layer=1,
+                )
+            )
+        else:
+            x = F.relu(self.conv1(x, edge_index_l1, None))
+        x = F.dropout(input=x, p=self.drop_rate, training=self.training)
+
+        if self.mode == 'gar':
+            if gar_sampling_variant == 'hybrid_full_cache':
+                # For sampled forward, fallback to per-batch COO->CSR/CSC conversion.
+                x = self.conv2(
+                    x=x,
+                    edge_index=edge_index_l2,
+                    edge_weight=None,
+                    sampling_debug_enabled=sampling_debug_enabled,
+                    sampling_debug_fail_fast=sampling_debug_fail_fast,
+                    sampling_debug_split=sampling_debug_split,
+                    sampling_debug_batch=sampling_debug_batch,
+                    sampling_debug_layer=2,
+                )
+            else:
+                x = self.conv2(
+                    x=x,
+                    edge_index=edge_index_l2,
+                    edge_weight=None,
+                    sampling_debug_enabled=sampling_debug_enabled,
+                    sampling_debug_fail_fast=sampling_debug_fail_fast,
+                    sampling_debug_split=sampling_debug_split,
+                    sampling_debug_batch=sampling_debug_batch,
+                    sampling_debug_layer=2,
+                )
+        elif self.mode == 'gas':
+            x = self.conv2(
+                x=x,
+                edge_index=edge_index_l2,
+                edge_weight=None,
+                sampling_debug_enabled=sampling_debug_enabled,
+                sampling_debug_fail_fast=sampling_debug_fail_fast,
+                sampling_debug_split=sampling_debug_split,
+                sampling_debug_batch=sampling_debug_batch,
+                sampling_debug_layer=2,
+            )
+        else:
+            x = self.conv2(x, edge_index_l2, None)
         return F.log_softmax(x, dim=1)
 
 
@@ -105,6 +264,30 @@ gcn_config = {
         'drop_rate': 0.5,
         'weight_decay': 1e-5,
         'hidden': 128,
+        'lr': 0.01,
+        'lr_schedular': LrSchedular(init_lr=0.01, mode='constant'),
+        'fold': 1,
+    },
+    'ogbn-arxiv': {
+        'drop_rate': 0.5,
+        'weight_decay': 0.0,
+        'hidden': 256,
+        'lr': 0.01,
+        'lr_schedular': LrSchedular(init_lr=0.01, mode='constant'),
+        'fold': 1,
+    },
+    'ogbn-products': {
+        'drop_rate': 0.5,
+        'weight_decay': 0.0,
+        'hidden': 256,
+        'lr': 0.01,
+        'lr_schedular': LrSchedular(init_lr=0.01, mode='constant'),
+        'fold': 1,
+    },
+    'ogbn-papers100M': {
+        'drop_rate': 0.5,
+        'weight_decay': 0.0,
+        'hidden': 256,
         'lr': 0.01,
         'lr_schedular': LrSchedular(init_lr=0.01, mode='constant'),
         'fold': 1,
